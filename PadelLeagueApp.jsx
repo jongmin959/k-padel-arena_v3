@@ -243,6 +243,294 @@ function generateRoundRobinRounds(teams, courtCount) {
   return rounds;
 }
 
+/* =====================================================================
+   ROUND ROBIN TOURNAMENT MODE — groups + knockout bracket.
+   Kept fully separate from generateRoundRobinRounds above (the simple
+   flat league), which stays untouched for anyone/anything still using it.
+   ===================================================================== */
+const GROUP_LETTERS = ["A", "B", "C", "D"];
+const KNOCKOUT_STAGES = ["ROUND_16", "QUARTERFINAL", "SEMIFINAL", "FINAL"];
+const STAGE_LABEL = {
+  ROUND_16: "ROUND 16",
+  QUARTERFINAL: "QUARTER FINAL",
+  SEMIFINAL: "SEMI FINAL",
+  FINAL: "FINAL",
+  THIRD_PLACE: "3RD PLACE",
+};
+
+function defaultTournament() {
+  return {
+    enabled: false,
+    groupCount: 3,
+    groups: { A: [], B: [], C: [], D: [] },
+    groupMatches: { A: [], B: [], C: [], D: [] },
+    qualifiersPerGroup: 2,
+    bracket: [], // [{ stage, matches: [{ id, teamAId, teamBId, scoreA, scoreB, isBye, feedsFrom }] }]
+    champion: null,
+    runnerUp: null,
+    thirdPlace: null,
+  };
+}
+
+/* Defends against old saved club data that predates this feature. */
+function withTournamentDefaults(league) {
+  if (!league) return league;
+  const t = league.tournament || {};
+  const d = defaultTournament();
+  return {
+    ...league,
+    tournament: {
+      ...d,
+      ...t,
+      groups: { ...d.groups, ...(t.groups || {}) },
+      groupMatches: { ...d.groupMatches, ...(t.groupMatches || {}) },
+    },
+  };
+}
+
+/* Splits teams across groupCount groups as evenly as possible — e.g.
+   14 teams / 3 groups -> 5/5/4, never more than 1 team apart. */
+function autoAssignGroups(teams, groupCount) {
+  const letters = GROUP_LETTERS.slice(0, groupCount);
+  const groups = {};
+  letters.forEach((l) => (groups[l] = []));
+  const shuffled = [...teams].sort(() => Math.random() - 0.5);
+  shuffled.forEach((team, i) => {
+    groups[letters[i % groupCount]].push(team.id);
+  });
+  return groups;
+}
+
+/* All-play-all within one group (circle method), flattened into a
+   single match list for that group, courts assigned round-robin. */
+function generateGroupMatches(teamIds, courtCount) {
+  let arr = [...teamIds];
+  if (arr.length % 2 !== 0) arr.push("BYE");
+  const n = arr.length;
+  if (n < 2) return [];
+  const totalRounds = n - 1;
+  let current = [...arr];
+  const matches = [];
+  let courtIdx = 0;
+  for (let r = 0; r < totalRounds; r++) {
+    for (let i = 0; i < n / 2; i++) {
+      const a = current[i];
+      const b = current[n - 1 - i];
+      if (a !== "BYE" && b !== "BYE") {
+        matches.push({
+          id: uid(),
+          court: (courtIdx % courtCount) + 1,
+          teamAId: a,
+          teamBId: b,
+          scoreA: "",
+          scoreB: "",
+        });
+        courtIdx++;
+      }
+    }
+    current = [current[0], current[n - 1], ...current.slice(1, n - 1)];
+  }
+  return matches;
+}
+
+/* Group standings: 승점(3/win) -> 승수 -> 득실차 -> 총득점. */
+function computeGroupStandings(teamIds, matches, teams) {
+  const stats = {};
+  teamIds.forEach((id) => {
+    const team = teams.find((t) => t.id === id);
+    stats[id] = { id, name: team?.name || "?", played: 0, win: 0, loss: 0, scored: 0, conceded: 0 };
+  });
+  matches.forEach((m) => {
+    const a = Number(m.scoreA);
+    const b = Number(m.scoreB);
+    if (m.scoreA === "" || m.scoreB === "" || isNaN(a) || isNaN(b)) return;
+    if (stats[m.teamAId]) {
+      stats[m.teamAId].played += 1;
+      stats[m.teamAId].scored += a;
+      stats[m.teamAId].conceded += b;
+      if (a > b) stats[m.teamAId].win += 1;
+      else stats[m.teamAId].loss += 1;
+    }
+    if (stats[m.teamBId]) {
+      stats[m.teamBId].played += 1;
+      stats[m.teamBId].scored += b;
+      stats[m.teamBId].conceded += a;
+      if (b > a) stats[m.teamBId].win += 1;
+      else stats[m.teamBId].loss += 1;
+    }
+  });
+  return Object.values(stats)
+    .map((s) => ({ ...s, points: s.win * 3, diff: s.scored - s.conceded }))
+    .sort((x, y) => y.points - x.points || y.win - x.win || y.diff - x.diff || y.scored - x.scored);
+}
+
+function nextPowerOf2(n) {
+  let p = 1;
+  while (p < n) p *= 2;
+  return p;
+}
+
+/* Seeds qualifiers into a knockout bracket: all #1 seeds first, then
+   all #2 seeds, etc. (standard seeding order), padded with BYEs to the
+   next power of 2, then paired with the classic 1-vs-last bracket
+   slotting so top seeds are spread apart. As a best-effort pass, swaps
+   adjacent pairs to avoid two teams from the SAME group meeting in the
+   very first round, when an alternative swap is available. */
+function buildSeedOrder(groups, qualifiersPerGroup) {
+  const letters = Object.keys(groups).filter((l) => groups[l].length > 0);
+  const seeds = [];
+  for (let rank = 0; rank < qualifiersPerGroup; rank++) {
+    letters.forEach((l) => {
+      const teamId = groups[l][rank];
+      if (teamId) seeds.push({ teamId, group: l, rank: rank + 1 });
+    });
+  }
+  return seeds;
+}
+
+function buildKnockoutBracket(seeds, courtCount) {
+  const size = nextPowerOf2(seeds.length);
+  const padded = [...seeds];
+  while (padded.length < size) padded.push(null); // BYE
+
+  // Classic seeded bracket order (1,size,2,size-1,...) via recursive halving.
+  const order = [1];
+  let cur = [1];
+  while (cur.length < size) {
+    const next = [];
+    const total = cur.length * 2;
+    cur.forEach((s) => {
+      next.push(s);
+      next.push(total + 1 - s);
+    });
+    cur = next;
+  }
+  let slots = cur.map((seedNum) => padded[seedNum - 1] || null);
+
+  // Best-effort: avoid same-group pairs in round 1 by swapping with a
+  // neighboring pair when that doesn't create a worse collision.
+  for (let i = 0; i < slots.length; i += 2) {
+    const a = slots[i];
+    const b = slots[i + 1];
+    if (a && b && a.group === b.group && i + 3 < slots.length) {
+      const c = slots[i + 2];
+      const d = slots[i + 3];
+      if (c && (!d || c.group !== a.group)) {
+        slots[i + 1] = c;
+        slots[i + 2] = b;
+      }
+    }
+  }
+
+  const startStageIdx = KNOCKOUT_STAGES.length - Math.log2(size);
+  const stages = KNOCKOUT_STAGES.slice(Math.max(0, startStageIdx));
+
+  const rounds = [];
+  let matchCount = size / 2;
+  let courtIdx = 0;
+  stages.forEach((stage, stageIdx) => {
+    const matches = [];
+    for (let i = 0; i < matchCount; i++) {
+      if (stageIdx === 0) {
+        const teamA = slots[i * 2];
+        const teamB = slots[i * 2 + 1];
+        const isBye = !teamA || !teamB;
+        matches.push({
+          id: uid(),
+          court: (courtIdx % courtCount) + 1,
+          teamAId: teamA?.teamId || null,
+          teamBId: teamB?.teamId || null,
+          scoreA: "",
+          scoreB: "",
+          isBye,
+          feedsFrom: null,
+        });
+        courtIdx++;
+      } else {
+        matches.push({
+          id: uid(),
+          court: (courtIdx % courtCount) + 1,
+          teamAId: null,
+          teamBId: null,
+          scoreA: "",
+          scoreB: "",
+          isBye: false,
+          feedsFrom: [i * 2, i * 2 + 1],
+        });
+        courtIdx++;
+      }
+    }
+    rounds.push({ stage, matches });
+    matchCount = matchCount / 2;
+  });
+
+  return rounds;
+}
+
+function matchWinnerId(m) {
+  if (!m) return null;
+  if (m.isBye) return m.teamAId || m.teamBId || null;
+  const a = Number(m.scoreA);
+  const b = Number(m.scoreB);
+  if (m.scoreA === "" || m.scoreB === "" || isNaN(a) || isNaN(b) || a === b) return null;
+  return a > b ? m.teamAId : m.teamBId;
+}
+
+/* Pure recompute: fills in each round's team slots from the previous
+   round's winners, and derives champion/runner-up/3rd place. Call this
+   after every score change — cheap, and never drifts out of sync. */
+function propagateBracket(bracket) {
+  const rounds = bracket.map((r) => ({ ...r, matches: r.matches.map((m) => ({ ...m })) }));
+  for (let ri = 1; ri < rounds.length; ri++) {
+    rounds[ri].matches.forEach((m) => {
+      if (!m.feedsFrom) return;
+      const [i1, i2] = m.feedsFrom;
+      m.teamAId = matchWinnerId(rounds[ri - 1].matches[i1]) || null;
+      m.teamBId = matchWinnerId(rounds[ri - 1].matches[i2]) || null;
+    });
+  }
+  const finalRound = rounds[rounds.length - 1];
+  const finalMatch = finalRound?.matches?.[0];
+  const semiRound = rounds[rounds.length - 2];
+
+  let champion = null;
+  let runnerUp = null;
+  if (finalMatch) {
+    const w = matchWinnerId(finalMatch);
+    if (w) {
+      champion = w;
+      runnerUp = w === finalMatch.teamAId ? finalMatch.teamBId : finalMatch.teamAId;
+    }
+  }
+
+  let thirdPlaceMatch = bracket.find((r) => r.stage === "THIRD_PLACE")?.matches?.[0] || null;
+  if (semiRound && semiRound.matches.length === 2) {
+    const loserA = (() => {
+      const m = semiRound.matches[0];
+      const w = matchWinnerId(m);
+      if (!w) return null;
+      return w === m.teamAId ? m.teamBId : m.teamAId;
+    })();
+    const loserB = (() => {
+      const m = semiRound.matches[1];
+      const w = matchWinnerId(m);
+      if (!w) return null;
+      return w === m.teamAId ? m.teamBId : m.teamAId;
+    })();
+    if (loserA && loserB) {
+      thirdPlaceMatch = thirdPlaceMatch
+        ? { ...thirdPlaceMatch, teamAId: loserA, teamBId: loserB }
+        : { id: uid(), court: 1, teamAId: loserA, teamBId: loserB, scoreA: "", scoreB: "", isBye: false, feedsFrom: null };
+    }
+  }
+  const thirdPlace = thirdPlaceMatch ? matchWinnerId(thirdPlaceMatch) : null;
+
+  const withoutThird = rounds.filter((r) => r.stage !== "THIRD_PLACE");
+  const finalRounds = thirdPlaceMatch ? [...withoutThird, { stage: "THIRD_PLACE", matches: [thirdPlaceMatch] }] : withoutThird;
+
+  return { rounds: finalRounds, champion, runnerUp, thirdPlace };
+}
+
 /* Mexicano — unlike Americano's rotate-for-variety approach, pairing is
    re-computed each round from the CURRENT standings, so it's generated
    one round at a time (not upfront): within each rank-ordered group of
@@ -550,27 +838,32 @@ export default function PadelLeagueApp() {
       gender: row.gender,
     };
 
-  const assembleLeague = (club, players, rounds, bookings) => ({
-    id: club.id,
-    name: club.name,
-    venue: club.venue,
-    format: club.format,
-    courtCount: club.court_count,
-    amenities: club.amenities || {},
-    photo: club.photo_url,
-    resultPhoto: club.result_photo_url,
-    ownerId: club.owner_id,
-    players,
-    teams: [], // round-robin pairing preview — session-local only, see README
-    rounds,
-    bookings,
-    createdAt: club.created_at,
-  });
+  // teams/tournament are session-local only (not yet in Supabase — see
+  // README), so reassembling from a DB refresh must carry them forward
+  // from whatever's already in state, never reset them to empty.
+  const assembleLeague = (club, players, rounds, bookings, prevLeague) =>
+    withTournamentDefaults({
+      id: club.id,
+      name: club.name,
+      venue: club.venue,
+      format: club.format,
+      courtCount: club.court_count,
+      amenities: club.amenities || {},
+      photo: club.photo_url,
+      resultPhoto: club.result_photo_url,
+      ownerId: club.owner_id,
+      players,
+      teams: prevLeague?.teams || [],
+      tournament: prevLeague?.tournament,
+      rounds,
+      bookings,
+      createdAt: club.created_at,
+    });
 
   const reloadClubData = useCallback(async (clubId) => {
     const [players, rounds, bookings] = await Promise.all([getClubPlayers(clubId), getRounds(clubId), getBookings(clubId)]);
     const { data: club } = await supabase.from("clubs").select("*").eq("id", clubId).single();
-    if (club) setLeague((prev) => assembleLeague(club, players, rounds, bookings));
+    if (club) setLeague((prev) => assembleLeague(club, players, rounds, bookings, prev));
   }, []);
 
   const loadEverything = useCallback(async () => {
@@ -1012,6 +1305,79 @@ export default function PadelLeagueApp() {
     setLeague((prev) => ({ ...prev, teams }));
   };
 
+  /* ---------------------------------------------------------------
+     ROUND ROBIN TOURNAMENT MODE handlers — all session-local for now
+     (same scope note as `teams` above: not yet written to Supabase).
+  --------------------------------------------------------------- */
+  const updateTournament = (patch) => {
+    setLeague((prev) => ({ ...prev, tournament: { ...prev.tournament, ...patch } }));
+  };
+
+  const setGroupCount = (count) => {
+    const letters = GROUP_LETTERS.slice(0, count);
+    const groups = {};
+    const groupMatches = {};
+    letters.forEach((l) => {
+      groups[l] = league.tournament.groups[l] || [];
+      groupMatches[l] = league.tournament.groupMatches[l] || [];
+    });
+    updateTournament({ groupCount: count, groups, groupMatches });
+  };
+
+  const autoAssignGroupsHandler = () => {
+    if (league.teams.length === 0) return;
+    const groups = autoAssignGroups(league.teams, league.tournament.groupCount);
+    updateTournament({ groups, groupMatches: {}, bracket: [], champion: null, runnerUp: null, thirdPlace: null });
+  };
+
+  const moveTeamToGroup = (teamId, toGroup) => {
+    const groups = {};
+    Object.keys(league.tournament.groups).forEach((l) => {
+      groups[l] = league.tournament.groups[l].filter((id) => id !== teamId);
+    });
+    if (!groups[toGroup]) groups[toGroup] = [];
+    groups[toGroup].push(teamId);
+    updateTournament({ groups });
+  };
+
+  const generateGroupStageMatches = () => {
+    const groupMatches = {};
+    Object.entries(league.tournament.groups).forEach(([letter, teamIds]) => {
+      if (teamIds.length >= 2) groupMatches[letter] = generateGroupMatches(teamIds, league.courtCount);
+    });
+    updateTournament({ groupMatches, bracket: [], champion: null, runnerUp: null, thirdPlace: null });
+  };
+
+  const updateGroupMatchScore = (groupLetter, matchId, field, value) => {
+    const groupMatches = {
+      ...league.tournament.groupMatches,
+      [groupLetter]: league.tournament.groupMatches[groupLetter].map((m) =>
+        m.id === matchId ? { ...m, [field]: value } : m
+      ),
+    };
+    updateTournament({ groupMatches });
+  };
+
+  const setQualifiersPerGroup = (n) => updateTournament({ qualifiersPerGroup: n });
+
+  const generateBracket = () => {
+    const { groups, groupMatches, qualifiersPerGroup } = league.tournament;
+    const seeds = buildSeedOrder(groups, qualifiersPerGroup);
+    if (seeds.length < 2) return;
+    const bracket = buildKnockoutBracket(seeds, league.courtCount);
+    const result = propagateBracket(bracket);
+    updateTournament({ bracket: result.rounds, champion: result.champion, runnerUp: result.runnerUp, thirdPlace: result.thirdPlace });
+    setTab("schedule");
+  };
+
+  const updateBracketScore = (stageIdx, matchId, field, value) => {
+    const bracket = league.tournament.bracket.map((r, ri) =>
+      ri !== stageIdx ? r : { ...r, matches: r.matches.map((m) => (m.id === matchId ? { ...m, [field]: value } : m)) }
+    );
+    const result = propagateBracket(bracket);
+    updateTournament({ bracket: result.rounds, champion: result.champion, runnerUp: result.runnerUp, thirdPlace: result.thirdPlace });
+  };
+
   const generateSchedule = async () => {
     try {
       if (league.format === "americano") {
@@ -1256,19 +1622,19 @@ export default function PadelLeagueApp() {
               active={league.format === "americano"}
               onClick={() => setFormat("americano")}
               label="아메리카노 · 개인전"
-              tooltip="매 라운드 파트너가 바뀌며 모두와 한 번씩 게임해요. 개인 포인트 합산으로 순위를 매겨요."
+              tooltip="매 라운드 파트너가 바뀌며 여러 참가자와 함께 경기하고 개인별 점수를 합산해 순위를 결정하는 방식"
             />
             <FormatPill
               active={league.format === "mexicano"}
               onClick={() => setFormat("mexicano")}
               label="멕시카노 · 개인전"
-              tooltip="라운드마다 현재 순위를 기준으로 짝을 다시 맞춰요 (1위+4위 vs 2위+3위). 실력 차가 나도 접전이 되도록 유도해요."
+              tooltip="매 라운드 현재 순위를 기준으로 비슷한 수준의 선수끼리 다시 조합하여 경기하는 방식"
             />
             <FormatPill
               active={league.format === "round_robin"}
               onClick={() => setFormat("round_robin")}
               label="라운드로빈 · 팀전"
-              tooltip="처음에 정한 고정 팀끼리 서로 한 번씩 맞붙는 리그전 방식이에요. (이 형식은 아직 이 기기에만 저장돼요)"
+              tooltip="참가 팀이 그룹으로 나뉘어 같은 그룹의 팀들과 리그전을 치른 후, 순위에 따라 토너먼트를 진행하는 방식"
             />
             <CourtStepper value={league.courtCount} onChange={handleCourtCountChange} />
             <div style={{ flex: 1 }} />
@@ -1402,6 +1768,16 @@ export default function PadelLeagueApp() {
             nameOf={nameOf}
             onGenerateNextMexicanoRound={generateNextMexicanoRound}
             onRemoveLastMexicanoRound={removeLastMexicanoRound}
+            tournament={{
+              onSetGroupCount: setGroupCount,
+              onAutoAssignGroups: autoAssignGroupsHandler,
+              onMoveTeamToGroup: moveTeamToGroup,
+              onGenerateGroupStage: generateGroupStageMatches,
+              onUpdateGroupMatchScore: updateGroupMatchScore,
+              onSetQualifiersPerGroup: setQualifiersPerGroup,
+              onGenerateBracket: generateBracket,
+              onUpdateBracketScore: updateBracketScore,
+            }}
           />
         )}
 
@@ -2132,23 +2508,78 @@ function SaveStatus({ status }) {
 }
 
 function FormatPill({ active, onClick, label, tooltip }) {
+  const [showTip, setShowTip] = useState(false);
   return (
-    <button
-      onClick={onClick}
-      title={tooltip}
-      style={{
-        padding: "7px 12px",
-        borderRadius: 999,
-        border: `1px solid ${active ? C.ball : "rgba(255,255,255,0.25)"}`,
-        background: active ? "rgba(215,241,59,0.12)" : "transparent",
-        color: active ? C.ball : "rgba(255,255,255,0.65)",
-        fontSize: 13,
-        fontWeight: 600,
-        cursor: "pointer",
-      }}
-    >
-      {label}
-    </button>
+    <div style={{ position: "relative", display: "inline-flex" }}>
+      <button
+        onClick={onClick}
+        title={tooltip}
+        onMouseEnter={() => setShowTip(true)}
+        onMouseLeave={() => setShowTip(false)}
+        style={{
+          padding: "7px 28px 7px 12px",
+          borderRadius: 999,
+          border: `1px solid ${active ? C.ball : "rgba(255,255,255,0.25)"}`,
+          background: active ? "rgba(215,241,59,0.12)" : "transparent",
+          color: active ? C.ball : "rgba(255,255,255,0.65)",
+          fontSize: 13,
+          fontWeight: 600,
+          cursor: "pointer",
+        }}
+      >
+        {label}
+      </button>
+      {/* Tap target for touch devices, where :hover/title never fires */}
+      <button
+        type="button"
+        aria-label={`${label} 설명 보기`}
+        onClick={(e) => {
+          e.stopPropagation();
+          setShowTip((s) => !s);
+        }}
+        style={{
+          position: "absolute",
+          right: 4,
+          top: "50%",
+          transform: "translateY(-50%)",
+          width: 18,
+          height: 18,
+          borderRadius: "50%",
+          border: `1px solid ${active ? C.ball : "rgba(255,255,255,0.4)"}`,
+          background: "transparent",
+          color: active ? C.ball : "rgba(255,255,255,0.55)",
+          fontSize: 10,
+          fontWeight: 700,
+          lineHeight: "16px",
+          padding: 0,
+          cursor: "pointer",
+        }}
+      >
+        i
+      </button>
+      {showTip && (
+        <div
+          onClick={() => setShowTip(false)}
+          style={{
+            position: "absolute",
+            top: "calc(100% + 6px)",
+            left: 0,
+            zIndex: 20,
+            width: 220,
+            padding: "8px 10px",
+            borderRadius: 8,
+            background: C.ink,
+            border: `1px solid ${C.ball}`,
+            color: "#fff",
+            fontSize: 11,
+            lineHeight: 1.4,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.3)",
+          }}
+        >
+          {tooltip}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2940,9 +3371,16 @@ function ScheduleTab({
   nameOf,
   onGenerateNextMexicanoRound,
   onRemoveLastMexicanoRound,
+  tournament,
 }) {
   const isMexicano = league.format === "mexicano";
   const isAmericano = league.format === "americano";
+  const isRoundRobin = league.format === "round_robin";
+
+  if (isRoundRobin) {
+    return <RoundRobinTournamentView league={league} nameOf={nameOf} {...tournament} />;
+  }
+
   const canGenerate = isAmericano || isMexicano ? league.players.length >= 4 : league.teams.length >= 2;
 
   const formatDescription = isAmericano
@@ -3056,6 +3494,333 @@ function ScheduleTab({
           </div>
         ))
       )}
+    </div>
+  );
+}
+
+/* =====================================================================
+   ROUND ROBIN TOURNAMENT MODE — group stage + knockout bracket UI.
+   Entirely new, additive components; AMERICANO/MEXICANO never render
+   any of this.
+   ===================================================================== */
+function TeamMatchCard({ court, teamAName, teamBName, scoreA, scoreB, onScoreA, onScoreB, isBye, readOnly }) {
+  const a = Number(scoreA);
+  const b = Number(scoreB);
+  const hasScore = scoreA !== "" && scoreB !== "" && !isNaN(a) && !isNaN(b);
+  const aWins = hasScore && a > b;
+  const bWins = hasScore && b > a;
+
+  if (isBye) {
+    return (
+      <div
+        style={{
+          borderRadius: 14,
+          background: C.paperDim,
+          border: "1px dashed rgba(0,0,0,0.15)",
+          padding: "14px 12px",
+          fontSize: 13,
+          color: "rgba(27,36,34,0.5)",
+          textAlign: "center",
+        }}
+      >
+        {teamAName || teamBName} — 부전승 (BYE)
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        borderRadius: 14,
+        overflow: "hidden",
+        background: C.turf,
+        border: `1px solid ${C.turfLight}`,
+        minWidth: 200,
+      }}
+    >
+      {court && (
+        <div style={{ padding: "6px 12px", borderBottom: `1px solid ${C.line}` }}>
+          <span style={{ fontFamily: "'Oswald', sans-serif", fontSize: 10, letterSpacing: "0.12em", color: "rgba(255,255,255,0.6)" }}>
+            COURT {court}
+          </span>
+        </div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 2, padding: "10px 12px" }}>
+        <div style={{ fontSize: 13, fontWeight: aWins ? 700 : 500, color: aWins ? C.ball : "#EDEFE8" }}>
+          {teamAName || "TBD"}
+        </div>
+        <div style={{ fontSize: 13, fontWeight: bWins ? 700 : 500, color: bWins ? C.ball : "#EDEFE8" }}>
+          {teamBName || "TBD"}
+        </div>
+      </div>
+      {!readOnly && teamAName && teamBName && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "0 12px 12px" }}>
+          <ScoreInput value={scoreA} onChange={onScoreA} highlight={aWins} />
+          <span style={{ color: "rgba(255,255,255,0.4)", fontFamily: "'JetBrains Mono', monospace" }}>:</span>
+          <ScoreInput value={scoreB} onChange={onScoreB} highlight={bWins} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GroupStandingsTable({ letter, standings }) {
+  return (
+    <SectionCard>
+      <Eyebrow>GROUP {letter} 순위</Eyebrow>
+      <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+        {standings.map((s, i) => (
+          <div
+            key={s.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "8px 10px",
+              borderRadius: 8,
+              background: i < 2 ? "rgba(215,241,59,0.15)" : C.paperDim,
+            }}
+          >
+            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, width: 16 }}>{i + 1}</span>
+            <span style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>{s.name}</span>
+            <span style={{ fontSize: 11, color: "rgba(27,36,34,0.5)" }}>
+              {s.win}승 {s.loss}패 · 득실 {s.diff > 0 ? `+${s.diff}` : s.diff}
+            </span>
+          </div>
+        ))}
+      </div>
+    </SectionCard>
+  );
+}
+
+function RoundRobinTournamentView({
+  league,
+  nameOf,
+  onSetGroupCount,
+  onAutoAssignGroups,
+  onMoveTeamToGroup,
+  onGenerateGroupStage,
+  onUpdateGroupMatchScore,
+  onSetQualifiersPerGroup,
+  onGenerateBracket,
+  onUpdateBracketScore,
+}) {
+  const t = league.tournament || defaultTournament(); // defends old saved clubs with no tournament data yet
+  const letters = GROUP_LETTERS.slice(0, t.groupCount);
+  const teamName = (id) => league.teams.find((x) => x.id === id)?.name || "?";
+  const hasGroupMatches = letters.some((l) => (t.groupMatches[l] || []).length > 0);
+  const hasBracket = t.bracket && t.bracket.length > 0;
+  const totalAssigned = letters.reduce((sum, l) => sum + (t.groups[l]?.length || 0), 0);
+  const maxQualifiers = Math.min(4, Math.max(1, Math.min(...letters.map((l) => t.groups[l]?.length || 0)) || 1));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <SectionCard>
+        <Eyebrow>대회 설정 — ROUND ROBIN + TOURNAMENT</Eyebrow>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 12 }}>
+          <div>
+            <div style={{ fontSize: 12, color: "rgba(27,36,34,0.55)", marginBottom: 4 }}>GROUP 수</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <IconBtn onClick={() => onSetGroupCount(Math.max(1, t.groupCount - 1))}>−</IconBtn>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, width: 16, textAlign: "center" }}>
+                {t.groupCount}
+              </span>
+              <IconBtn onClick={() => onSetGroupCount(Math.min(4, t.groupCount + 1))}>+</IconBtn>
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "rgba(27,36,34,0.55)", marginBottom: 4 }}>참가 팀</div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 15 }}>{league.teams.length}팀</div>
+          </div>
+        </div>
+        <div style={{ marginTop: 14 }}>
+          <PrimaryButton onClick={onAutoAssignGroups} icon={Shuffle} disabled={league.teams.length < 2}>
+            GROUP 자동 배정
+          </PrimaryButton>
+        </div>
+        {league.teams.length === 0 && <EmptyHint text="선수 · 팀 탭에서 먼저 팀을 편성해 주세요." />}
+      </SectionCard>
+
+      {totalAssigned > 0 && (
+        <SectionCard>
+          <Eyebrow>GROUP 배정 ({totalAssigned}팀)</Eyebrow>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginTop: 10 }}>
+            {letters.map((l) => (
+              <div key={l} style={{ background: C.paperDim, borderRadius: 10, padding: 10 }}>
+                <div style={{ fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+                  GROUP {l} <span style={{ color: "rgba(27,36,34,0.5)", fontWeight: 500 }}>{(t.groups[l] || []).length}팀</span>
+                </div>
+                {(t.groups[l] || []).map((teamId) => (
+                  <div key={teamId} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0" }}>
+                    <span style={{ flex: 1, fontSize: 13 }}>{teamName(teamId)}</span>
+                    <select
+                      value={l}
+                      onChange={(e) => onMoveTeamToGroup(teamId, e.target.value)}
+                      style={{ fontSize: 11, padding: "2px 4px", borderRadius: 6, border: "1px solid rgba(0,0,0,0.15)" }}
+                    >
+                      {letters.map((ll) => (
+                        <option key={ll} value={ll}>
+                          {ll}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <PrimaryButton onClick={onGenerateGroupStage} icon={RefreshCw}>
+              {hasGroupMatches ? "GROUP 대진 다시 생성" : "GROUP 대진 생성"}
+            </PrimaryButton>
+          </div>
+        </SectionCard>
+      )}
+
+      {hasGroupMatches && (
+        <>
+          <div style={{ fontFamily: "'Oswald', sans-serif", fontSize: 18, fontWeight: 700 }}>GROUP STAGE</div>
+          {letters.map((l) => {
+            const matches = t.groupMatches[l] || [];
+            if (matches.length === 0) return null;
+            const standings = computeGroupStandings(t.groups[l] || [], matches, league.teams);
+            return (
+              <div key={l} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 15 }}>GROUP {l}</div>
+                <div style={{ overflowX: "auto", display: "flex", gap: 10, paddingBottom: 4 }}>
+                  {matches.map((m) => (
+                    <div key={m.id} style={{ minWidth: 200, flex: "0 0 auto" }}>
+                      <TeamMatchCard
+                        court={m.court}
+                        teamAName={teamName(m.teamAId)}
+                        teamBName={teamName(m.teamBId)}
+                        scoreA={m.scoreA}
+                        scoreB={m.scoreB}
+                        onScoreA={(v) => onUpdateGroupMatchScore(l, m.id, "scoreA", v)}
+                        onScoreB={(v) => onUpdateGroupMatchScore(l, m.id, "scoreB", v)}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <GroupStandingsTable letter={l} standings={standings} />
+              </div>
+            );
+          })}
+
+          <SectionCard>
+            <Eyebrow>토너먼트 진출</Eyebrow>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13 }}>각 GROUP 상위</span>
+              <select
+                value={t.qualifiersPerGroup}
+                onChange={(e) => onSetQualifiersPerGroup(Number(e.target.value))}
+                style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid rgba(0,0,0,0.15)", fontWeight: 700 }}
+              >
+                {Array.from({ length: maxQualifiers }, (_, i) => i + 1).map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+              <span style={{ fontSize: 13 }}>
+                팀 진출 → 총 {Math.min(...letters.map((l) => t.groups[l]?.length || 0)) >= t.qualifiersPerGroup ? letters.length * t.qualifiersPerGroup : "?"}팀
+              </span>
+            </div>
+            <div style={{ marginTop: 14 }}>
+              <PrimaryButton onClick={onGenerateBracket} icon={Trophy}>
+                {hasBracket ? "토너먼트 대진 다시 생성" : "토너먼트 대진 생성"}
+              </PrimaryButton>
+            </div>
+          </SectionCard>
+        </>
+      )}
+
+      {hasBracket && (
+        <KnockoutBracketView
+          league={league}
+          nameOf={teamName}
+          onUpdateBracketScore={onUpdateBracketScore}
+          champion={t.champion}
+          runnerUp={t.runnerUp}
+          thirdPlace={t.thirdPlace}
+        />
+      )}
+    </div>
+  );
+}
+
+function KnockoutBracketView({ league, nameOf, onUpdateBracketScore, champion, runnerUp, thirdPlace }) {
+  const t = league.tournament || defaultTournament();
+  const mainRounds = (t.bracket || []).filter((r) => r.stage !== "THIRD_PLACE");
+  const thirdRound = (t.bracket || []).find((r) => r.stage === "THIRD_PLACE");
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ fontFamily: "'Oswald', sans-serif", fontSize: 18, fontWeight: 700 }}>KNOCKOUT STAGE</div>
+
+      {champion && (
+        <SectionCard>
+          <div style={{ textAlign: "center", padding: "10px 0" }}>
+            <div style={{ fontSize: 28 }}>🏆</div>
+            <Eyebrow color={C.charcoal}>CHAMPION</Eyebrow>
+            <div style={{ fontFamily: "'Oswald', sans-serif", fontWeight: 700, fontSize: 22, marginTop: 4 }}>{nameOf(champion)}</div>
+            {runnerUp && (
+              <div style={{ marginTop: 10, fontSize: 13, color: "rgba(27,36,34,0.6)" }}>
+                RUNNER-UP · {nameOf(runnerUp)}
+              </div>
+            )}
+            {thirdPlace && (
+              <div style={{ marginTop: 2, fontSize: 12, color: "rgba(27,36,34,0.45)" }}>3RD PLACE · {nameOf(thirdPlace)}</div>
+            )}
+          </div>
+        </SectionCard>
+      )}
+
+      {/* Mobile: horizontal scroll so the bracket never overflows the screen. */}
+      <div style={{ overflowX: "auto", paddingBottom: 8 }}>
+        <div style={{ display: "flex", gap: 24, minWidth: "max-content" }}>
+          {mainRounds.map((round, ri) => (
+            <div key={round.stage} style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 210 }}>
+              <div style={{ fontFamily: "'Oswald', sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.08em" }}>
+                {STAGE_LABEL[round.stage]}
+              </div>
+              {round.matches.map((m) => (
+                <TeamMatchCard
+                  key={m.id}
+                  court={m.court}
+                  teamAName={m.teamAId ? nameOf(m.teamAId) : null}
+                  teamBName={m.teamBId ? nameOf(m.teamBId) : null}
+                  scoreA={m.scoreA}
+                  scoreB={m.scoreB}
+                  isBye={m.isBye}
+                  readOnly={!m.teamAId || !m.teamBId}
+                  onScoreA={(v) => onUpdateBracketScore(ri, m.id, "scoreA", v)}
+                  onScoreB={(v) => onUpdateBracketScore(ri, m.id, "scoreB", v)}
+                />
+              ))}
+            </div>
+          ))}
+          {thirdRound && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 210 }}>
+              <div style={{ fontFamily: "'Oswald', sans-serif", fontSize: 13, fontWeight: 700, letterSpacing: "0.08em" }}>
+                {STAGE_LABEL.THIRD_PLACE}
+              </div>
+              {thirdRound.matches.map((m) => (
+                <TeamMatchCard
+                  key={m.id}
+                  court={m.court}
+                  teamAName={nameOf(m.teamAId)}
+                  teamBName={nameOf(m.teamBId)}
+                  scoreA={m.scoreA}
+                  scoreB={m.scoreB}
+                  onScoreA={(v) => onUpdateBracketScore(mainRounds.length, m.id, "scoreA", v)}
+                  onScoreB={(v) => onUpdateBracketScore(mainRounds.length, m.id, "scoreB", v)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
